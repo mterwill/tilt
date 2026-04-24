@@ -250,8 +250,10 @@ func (w *Reconciler) addOrReplace(ctx context.Context, watcherKey watcherID, kd 
 
 	if existing, ok := w.watchers[watcherKey]; ok {
 		if existing.cluster != newCK {
-			logger.Get(ctx).Warnf("kubernetesdiscovery: cluster key changed for %s: %s revision %v -> %v",
+			msg := fmt.Sprintf("kubernetesdiscovery: cluster key changed for %s: %s revision %v -> %v",
 				watcherKey, existing.cluster.name, existing.cluster.revision, newCK.revision)
+			logger.Get(ctx).Warnf("%s", msg)
+			fmt.Println(msg)
 			w.rekeyClusterData(ctx, existing.cluster, newCK)
 		}
 		// if a watcher already exists, just tear it down and we'll set it up from scratch so that
@@ -510,9 +512,11 @@ func (w *Reconciler) buildStatus(ctx context.Context, watcher watcher) v1alpha1.
 			}
 		}
 		if len(watchedUIDs) > 0 {
-			logger.Get(ctx).Warnf("kubernetesdiscovery: buildStatus found 0 pods for watcher with %d UID watches %v (clusterKey=%s/%v, knownPods=%d, knownDescendents=%d, watcherAge=%s)",
+			msg := fmt.Sprintf("kubernetesdiscovery: buildStatus found 0 pods for watcher with %d UID watches %v (clusterKey=%s/%v, knownPods=%d, knownDescendents=%d, watcherAge=%s)",
 				len(watchedUIDs), watchedUIDs, watcher.cluster.name, watcher.cluster.revision,
 				len(w.knownPods), len(w.knownDescendentPodUIDs), time.Since(watcher.startTime).Truncate(time.Second))
+			logger.Get(ctx).Warnf("%s", msg)
+			fmt.Println(msg)
 		}
 	}
 
@@ -637,8 +641,10 @@ func (w *Reconciler) rekeyClusterData(ctx context.Context, oldKey, newKey cluste
 	}
 
 	if migrated > 0 {
-		logger.Get(ctx).Warnf("kubernetesdiscovery: re-keyed %d pods from cluster %s (revision %v -> %v)",
+		msg := fmt.Sprintf("kubernetesdiscovery: re-keyed %d pods from cluster %s (revision %v -> %v)",
 			migrated, oldKey.name, oldKey.revision, newKey.revision)
+		logger.Get(ctx).Warnf("%s", msg)
+		fmt.Println(msg)
 	}
 }
 
@@ -734,7 +740,9 @@ func (w *Reconciler) triagePodTree(nsKey nsKey, pod *v1.Pod, objTree k8s.ObjectR
 func (w *Reconciler) handlePodChange(ctx context.Context, nsKey nsKey, ownerFetcher k8s.OwnerFetcher, pod *v1.Pod) {
 	objTree, err := ownerFetcher.OwnerTreeOf(ctx, k8s.NewK8sEntity(pod))
 	if err != nil {
-		logger.Get(ctx).Warnf("kubernetesdiscovery: resolving owner tree for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		msg := fmt.Sprintf("kubernetesdiscovery: resolving owner tree for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		logger.Get(ctx).Warnf("%s", msg)
+		fmt.Println(msg)
 		w.fallbackRequeueForKnownPod(nsKey, pod)
 		return
 	}
@@ -935,8 +943,10 @@ func (w *Reconciler) dispatchPodChangesLoop(ctx context.Context, nsKey nsKey, ow
 		select {
 		case obj, ok := <-ch:
 			if !ok {
-				logger.Get(ctx).Warnf("kubernetesdiscovery: pod watch channel closed for namespace %s (cluster %s); affected watchers will not receive further pod updates",
+				msg := fmt.Sprintf("kubernetesdiscovery: pod watch channel closed for namespace %s (cluster %s); affected watchers will not receive further pod updates",
 					nsKey.namespace, nsKey.cluster.name)
+				logger.Get(ctx).Warnf("%s", msg)
+				fmt.Println(msg)
 				return
 			}
 
@@ -960,8 +970,10 @@ func (w *Reconciler) dispatchPodChangesLoop(ctx context.Context, nsKey nsKey, ow
 			logger.Get(ctx).Debugf("kubernetesdiscovery: dispatch loop heartbeat for namespace %s (cluster %s): %d events processed, last event %s ago",
 				nsKey.namespace, nsKey.cluster.name, eventCount, sinceLastEvent)
 		case <-ctx.Done():
-			logger.Get(ctx).Warnf("kubernetesdiscovery: dispatch loop context cancelled for namespace %s (cluster %s)",
+			msg := fmt.Sprintf("kubernetesdiscovery: dispatch loop context cancelled for namespace %s (cluster %s)",
 				nsKey.namespace, nsKey.cluster.name)
+			logger.Get(ctx).Warnf("%s", msg)
+			fmt.Println(msg)
 			return
 		}
 	}
