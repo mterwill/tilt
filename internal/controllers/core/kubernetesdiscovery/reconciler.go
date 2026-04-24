@@ -246,7 +246,14 @@ func (w *Reconciler) getKubernetesDiscovery(ctx context.Context, key watcherID) 
 }
 
 func (w *Reconciler) addOrReplace(ctx context.Context, watcherKey watcherID, kd *store.KubernetesDiscovery, cluster *v1alpha1.Cluster) {
-	if _, ok := w.watchers[watcherKey]; ok {
+	newCK := newClusterKey(cluster)
+
+	if existing, ok := w.watchers[watcherKey]; ok {
+		if existing.cluster != newCK {
+			logger.Get(ctx).Warnf("kubernetesdiscovery: cluster key changed for %s: %s revision %v -> %v",
+				watcherKey, existing.cluster.name, existing.cluster.revision, newCK.revision)
+			w.rekeyClusterData(ctx, existing.cluster, newCK)
+		}
 		// if a watcher already exists, just tear it down and we'll set it up from scratch so that
 		// we don't have to diff a bunch of different pieces
 		w.teardown(watcherKey)
@@ -263,7 +270,7 @@ func (w *Reconciler) addOrReplace(ctx context.Context, watcherKey watcherID, kd 
 		if err != nil {
 			w.watchers[watcherKey] = watcher{
 				spec:        *kd.Spec.DeepCopy(),
-				cluster:     newClusterKey(cluster),
+				cluster:     newCK,
 				errorReason: fmt.Sprintf("invalid label selectors: %v", err),
 			}
 			return
@@ -274,7 +281,7 @@ func (w *Reconciler) addOrReplace(ctx context.Context, watcherKey watcherID, kd 
 	newWatcher := watcher{
 		spec:           *kd.Spec.DeepCopy(),
 		extraSelectors: extraSelectors,
-		cluster:        newClusterKey(cluster),
+		cluster:        newCK,
 	}
 
 	kCli, err := w.clients.GetK8sClient(kd, cluster)
@@ -503,8 +510,9 @@ func (w *Reconciler) buildStatus(ctx context.Context, watcher watcher) v1alpha1.
 			}
 		}
 		if len(watchedUIDs) > 0 {
-			logger.Get(ctx).Debugf("kubernetesdiscovery: buildStatus found 0 pods for watcher with %d UID watches %v (knownPods=%d, knownDescendents=%d, watcherAge=%s)",
-				len(watchedUIDs), watchedUIDs, len(w.knownPods), len(w.knownDescendentPodUIDs), time.Since(watcher.startTime).Truncate(time.Second))
+			logger.Get(ctx).Warnf("kubernetesdiscovery: buildStatus found 0 pods for watcher with %d UID watches %v (clusterKey=%s/%v, knownPods=%d, knownDescendents=%d, watcherAge=%s)",
+				len(watchedUIDs), watchedUIDs, watcher.cluster.name, watcher.cluster.revision,
+				len(w.knownPods), len(w.knownDescendentPodUIDs), time.Since(watcher.startTime).Truncate(time.Second))
 		}
 	}
 
@@ -557,6 +565,81 @@ func (w *Reconciler) upsertPod(cluster clusterKey, pod *v1.Pod) {
 	defer w.mu.Unlock()
 	podKey := uidKey{cluster: cluster, uid: pod.UID}
 	w.knownPods[podKey] = pod
+}
+
+// rekeyClusterData migrates pod-related map entries from oldKey to newKey when
+// a cluster's ConnectedAt timestamp changes. This preserves pod data across
+// cluster reconnections so that buildStatus can still find pods while the new
+// dispatch loop is re-populating.
+//
+// mu must be held by caller.
+func (w *Reconciler) rekeyClusterData(ctx context.Context, oldKey, newKey clusterKey) {
+	if oldKey == newKey {
+		return
+	}
+
+	migrated := 0
+
+	for k, v := range w.knownPods {
+		if k.cluster == oldKey {
+			w.knownPods[uidKey{cluster: newKey, uid: k.uid}] = v
+			delete(w.knownPods, k)
+			migrated++
+		}
+	}
+
+	for k, v := range w.knownDescendentPodUIDs {
+		if k.cluster == oldKey {
+			w.knownDescendentPodUIDs[uidKey{cluster: newKey, uid: k.uid}] = v
+			delete(w.knownDescendentPodUIDs, k)
+		}
+	}
+
+	for k, v := range w.knownPodOwnerCreation {
+		if k.cluster == oldKey {
+			w.knownPodOwnerCreation[uidKey{cluster: newKey, uid: k.uid}] = v
+			delete(w.knownPodOwnerCreation, k)
+		}
+	}
+
+	for k, v := range w.deletedPods {
+		if k.cluster == oldKey {
+			w.deletedPods[uidKey{cluster: newKey, uid: k.uid}] = v
+			delete(w.deletedPods, k)
+		}
+	}
+
+	for k, ancestors := range w.podToAncestors {
+		keyMatch := k.cluster == oldKey
+
+		var newAncestors []uidKey
+		for i, a := range ancestors {
+			if a.cluster == oldKey {
+				if newAncestors == nil {
+					newAncestors = make([]uidKey, len(ancestors))
+					copy(newAncestors, ancestors[:i])
+				}
+				newAncestors[i] = uidKey{cluster: newKey, uid: a.uid}
+			} else if newAncestors != nil {
+				newAncestors[i] = a
+			}
+		}
+
+		if keyMatch {
+			if newAncestors == nil {
+				newAncestors = ancestors
+			}
+			w.podToAncestors[uidKey{cluster: newKey, uid: k.uid}] = newAncestors
+			delete(w.podToAncestors, k)
+		} else if newAncestors != nil {
+			w.podToAncestors[k] = newAncestors
+		}
+	}
+
+	if migrated > 0 {
+		logger.Get(ctx).Warnf("kubernetesdiscovery: re-keyed %d pods from cluster %s (revision %v -> %v)",
+			migrated, oldKey.name, oldKey.revision, newKey.revision)
+	}
 }
 
 // triageResult is a KubernetesDiscovery key and the UID (if any) of the watch ref that matched the Pod event.

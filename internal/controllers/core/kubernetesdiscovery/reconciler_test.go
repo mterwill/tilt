@@ -619,6 +619,60 @@ func TestClusterChange(t *testing.T) {
 		podNameMap{pod1UID: "pod1ClusterB", pod2UID: "pod2ClusterB"})
 }
 
+// TestClusterReconnectionPreservesPods verifies that when a cluster reconnects
+// (new ConnectedAt timestamp), pod data discovered via the old dispatch loop
+// is re-keyed to the new cluster key so that buildStatus can still find it
+// before the new dispatch loop has re-populated.
+func TestClusterReconnectionPreservesPods(t *testing.T) {
+	f := newFixture(t)
+
+	ns := k8s.Namespace("ns")
+	dep, rs := f.buildK8sDeployment(ns, "dep")
+
+	key := types.NamespacedName{Namespace: "some-ns", Name: "kd"}
+	kd := &v1alpha1.KubernetesDiscovery{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+		Spec: v1alpha1.KubernetesDiscoverySpec{
+			Watches: []v1alpha1.KubernetesWatchRef{
+				{
+					UID:       string(rs.UID),
+					Namespace: ns.String(),
+					Name:      rs.Name,
+				},
+			},
+		},
+	}
+
+	f.injectK8sObjects(*kd, dep, rs)
+	f.Create(kd)
+	f.requireMonitorStarted(key)
+
+	pod := f.buildPod(ns, "pod", nil, rs)
+	f.injectK8sObjects(*kd, pod)
+	f.requireObservedPods(key, ancestorMap{pod.UID: rs.UID}, nil)
+
+	// Create a new client (simulating cluster reconnection) with NO pods.
+	// This means the new dispatch loop won't discover any pods on its own.
+	kCliNew := k8s.NewFakeK8sClient(t)
+	connectedAt := f.clients.SetK8sClient(clusterNN(*kd), kCliNew)
+
+	// Update the Cluster object's ConnectedAt to trigger a key change.
+	cluster := f.getCluster(clusterNN(*kd))
+	cluster.Status.ConnectedAt = connectedAt.DeepCopy()
+	require.NoError(t, f.Client.Status().Update(f.ctx, cluster))
+
+	// Reconcile: addOrReplace detects the key change and calls
+	// rekeyClusterData, migrating pod data to the new key.
+	f.MustReconcile(key)
+
+	// The pod should still be visible even though the new client has no pods,
+	// because rekeyClusterData preserved it under the new cluster key.
+	f.MustGet(key, kd)
+	require.Len(t, kd.Status.Pods, 1, "pod data should survive cluster reconnection via re-keying")
+	assert.Equal(t, pod.Name, kd.Status.Pods[0].Name)
+	assert.Equal(t, string(rs.UID), kd.Status.Pods[0].AncestorUID)
+}
+
 func TestHangOntoDeletedPodsWhenNoSibling(t *testing.T) {
 	f := newFixture(t)
 
