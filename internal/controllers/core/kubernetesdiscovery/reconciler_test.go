@@ -708,6 +708,64 @@ func TestNoHangOntoDeletedPodsWhenSiblingExists(t *testing.T) {
 	f.requireObservedPods(key, ancestorMap{podB.UID: rs.UID}, nil)
 }
 
+// TestFallbackRequeueOnOwnerTreeError verifies that when OwnerTreeOf fails for
+// a pod that was previously triaged, the reconciler still requeues the affected
+// watchers so the updated pod data (already stored in knownPods) is picked up.
+func TestFallbackRequeueOnOwnerTreeError(t *testing.T) {
+	f := newFixture(t)
+
+	ns := k8s.Namespace("ns")
+	dep, rs := f.buildK8sDeployment(ns, "dep")
+
+	key := types.NamespacedName{Namespace: "some-ns", Name: "kd"}
+	kd := &v1alpha1.KubernetesDiscovery{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+		Spec: v1alpha1.KubernetesDiscoverySpec{
+			Watches: []v1alpha1.KubernetesWatchRef{
+				{
+					UID:       string(rs.UID),
+					Namespace: ns.String(),
+					Name:      rs.Name,
+				},
+			},
+		},
+	}
+
+	f.injectK8sObjects(*kd, dep, rs)
+	f.Create(kd)
+	f.requireMonitorStarted(key)
+
+	// Phase 1: Pod arrives and is successfully triaged.
+	pod := f.buildPod(ns, "pod", nil, rs)
+	f.injectK8sObjects(*kd, pod)
+	f.requireObservedPods(key, ancestorMap{pod.UID: rs.UID}, nil)
+
+	// Phase 2: Inject an API error to make OwnerTreeOf fail.
+	kCli := f.clients.MustK8sClient(clusterNN(*kd))
+	kCli.ExternalSetGetByReferenceError(errors.New("server throttled: 429"))
+
+	// Update the pod (e.g. it becomes Ready). The upsertPod call will succeed
+	// (it stores the raw pod), but handlePodChange's OwnerTreeOf will fail.
+	// The fallback requeue should still trigger reconciliation with the updated
+	// pod data that upsertPod already stored.
+	updatedPod := pod.DeepCopy()
+	updatedPod.Status.Phase = v1.PodRunning
+	updatedPod.Status.ContainerStatuses = []v1.ContainerStatus{
+		{
+			Name:  "main",
+			Ready: true,
+			State: v1.ContainerState{
+				Running: &v1.ContainerStateRunning{},
+			},
+		},
+	}
+	kCli.UpsertPod(updatedPod)
+
+	// The KD should still be updated because fallback requeue triggers the
+	// reconciler to rebuild the status from knownPods.
+	f.requireObservedPods(key, ancestorMap{pod.UID: rs.UID}, nil)
+}
+
 type fixture struct {
 	*fake.ControllerFixture
 	t       *testing.T

@@ -92,8 +92,10 @@ type FakeK8sClient struct {
 	// multiple objects for the same name aren't returned.
 	currentVersions         map[string]types.UID
 	getByReferenceCallCount int
+	getByReferenceError     error
 	listCallCount           int
 	listReturnsEmpty        bool
+	listMetaError           error
 
 	ExecCalls           []ExecCall
 	ExecOutputs         []io.Reader
@@ -467,6 +469,9 @@ func (c *FakeK8sClient) GetMetaByReference(ctx context.Context, ref v1.ObjectRef
 	defer c.mu.Unlock()
 
 	c.getByReferenceCallCount++
+	if c.getByReferenceError != nil {
+		return nil, c.getByReferenceError
+	}
 	resp, ok := c.entities[ref.UID]
 	if !ok {
 		logger.Get(ctx).Infof("FakeK8sClient.GetMetaByReference: resource not found: %s", ref.Name)
@@ -480,6 +485,9 @@ func (c *FakeK8sClient) ListMeta(_ context.Context, gvk schema.GroupVersionKind,
 	defer c.mu.Unlock()
 
 	c.listCallCount++
+	if c.listMetaError != nil {
+		return nil, c.listMetaError
+	}
 	if c.listReturnsEmpty {
 		return nil, nil
 	}
@@ -675,6 +683,14 @@ func (c *FakeK8sClient) CheckConnected(ctx context.Context) (*version.Info, erro
 
 func (c *FakeK8sClient) OwnerFetcher() OwnerFetcher {
 	return c.ownerFetcher
+}
+
+// ExternalSetGetByReferenceError sets an error to be returned by
+// GetMetaByReference. Thread-safe for use during active reconciliation.
+func (c *FakeK8sClient) ExternalSetGetByReferenceError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.getByReferenceError = err
 }
 
 type ReaderCloser struct {

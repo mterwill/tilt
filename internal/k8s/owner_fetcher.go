@@ -54,6 +54,34 @@ type resourceNamespace struct {
 	GVK       schema.GroupVersionKind
 }
 
+// retriableOnce is like sync.Once but allows retrying if the function reports failure.
+// On success, subsequent calls are no-ops (like sync.Once).
+// On failure, subsequent calls will re-attempt the function.
+type retriableOnce struct {
+	mu   sync.Mutex
+	done bool
+}
+
+func (r *retriableOnce) Do(f func() bool) {
+	r.mu.Lock()
+	if r.done {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+
+	// Unlike sync.Once we don't deduplicate concurrent calls, but this is
+	// acceptable for metadata fetches where the cost of a rare duplicate
+	// list is far lower than the cost of a permanently failed cache entry.
+	ok := f()
+
+	if ok {
+		r.mu.Lock()
+		r.done = true
+		r.mu.Unlock()
+	}
+}
+
 type MetaClient interface {
 	GetMetaByReference(ctx context.Context, ref v1.ObjectReference) (metav1.Object, error)
 	ListMeta(ctx context.Context, gvk schema.GroupVersionKind, ns Namespace) ([]metav1.Object, error)
@@ -67,7 +95,7 @@ type OwnerFetcher struct {
 	mu        *sync.Mutex
 
 	metaCache       map[types.UID]metav1.Object
-	resourceFetches map[resourceNamespace]*sync.Once
+	resourceFetches map[resourceNamespace]*retriableOnce
 }
 
 func NewOwnerFetcher(ctx context.Context, metaClient MetaClient) OwnerFetcher {
@@ -78,17 +106,17 @@ func NewOwnerFetcher(ctx context.Context, metaClient MetaClient) OwnerFetcher {
 		mu:        &sync.Mutex{},
 
 		metaCache:       make(map[types.UID]metav1.Object),
-		resourceFetches: make(map[resourceNamespace]*sync.Once),
+		resourceFetches: make(map[resourceNamespace]*retriableOnce),
 	}
 }
 
-func (v OwnerFetcher) getOrCreateResourceFetch(gvk schema.GroupVersionKind, ns Namespace) *sync.Once {
+func (v OwnerFetcher) getOrCreateResourceFetch(gvk schema.GroupVersionKind, ns Namespace) *retriableOnce {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	rns := resourceNamespace{Namespace: ns, GVK: gvk}
 	fetch, ok := v.resourceFetches[rns]
 	if !ok {
-		fetch = &sync.Once{}
+		fetch = &retriableOnce{}
 		v.resourceFetches[rns] = fetch
 	}
 	return fetch
@@ -98,11 +126,11 @@ func (v OwnerFetcher) getOrCreateResourceFetch(gvk schema.GroupVersionKind, ns N
 // the first time we need that resource, then watch updates.
 func (v OwnerFetcher) ensureResourceFetched(gvk schema.GroupVersionKind, ns Namespace) {
 	fetch := v.getOrCreateResourceFetch(gvk, ns)
-	fetch.Do(func() {
+	fetch.Do(func() bool {
 		metas, err := v.cli.ListMeta(v.globalCtx, gvk, ns)
 		if err != nil {
-			logger.Get(v.globalCtx).Debugf("Error fetching metadata: %v", err)
-			return
+			logger.Get(v.globalCtx).Warnf("Error fetching metadata for %s in %s: %v", gvk, ns, err)
+			return false
 		}
 
 		v.mu.Lock()
@@ -113,8 +141,8 @@ func (v OwnerFetcher) ensureResourceFetched(gvk schema.GroupVersionKind, ns Name
 
 		ch, err := v.cli.WatchMeta(v.globalCtx, gvk, ns)
 		if err != nil {
-			logger.Get(v.globalCtx).Debugf("Error watching metadata: %v", err)
-			return
+			logger.Get(v.globalCtx).Warnf("Error watching metadata for %s in %s: %v", gvk, ns, err)
+			return false
 		}
 
 		go func() {
@@ -130,6 +158,8 @@ func (v OwnerFetcher) ensureResourceFetched(gvk schema.GroupVersionKind, ns Name
 				v.mu.Unlock()
 			}
 		}()
+
+		return true
 	})
 }
 
@@ -145,6 +175,15 @@ func (v OwnerFetcher) getOrCreatePromise(id types.UID) (*objectTreePromise, bool
 		v.cache[id] = promise
 	}
 	return promise, ok
+}
+
+// evictPromise removes a rejected promise from the cache so that subsequent
+// calls to getOrCreatePromise will create a fresh promise and retry.
+// This prevents transient API errors from permanently poisoning the cache.
+func (v OwnerFetcher) evictPromise(id types.UID) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	delete(v.cache, id)
 }
 
 func (v OwnerFetcher) OwnerTreeOfRef(ctx context.Context, ref v1.ObjectReference) (result ObjectRefTree, err error) {
@@ -165,6 +204,7 @@ func (v OwnerFetcher) ownerTreeOfRefHelper(ctx context.Context, ref v1.ObjectRef
 	defer func() {
 		if err != nil {
 			promise.reject(err)
+			v.evictPromise(uid)
 		} else {
 			promise.resolve(result)
 		}
@@ -210,6 +250,7 @@ func (v OwnerFetcher) OwnerTreeOf(ctx context.Context, entity K8sEntity) (result
 	defer func() {
 		if err != nil {
 			promise.reject(err)
+			v.evictPromise(uid)
 		} else {
 			promise.resolve(result)
 		}
