@@ -213,6 +213,8 @@ func (v OwnerFetcher) ownerTreeOfRefHelper(ctx context.Context, ref v1.ObjectRef
 	meta, err := v.getMetaByReference(ctx, ref)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			logger.Get(ctx).Debugf("owner_fetcher: %s %s/%s (uid=%s) not found; owner tree will be truncated",
+				ref.Kind, ref.Namespace, ref.Name, ref.UID)
 			return ObjectRefTree{Ref: ref}, nil
 		}
 		return ObjectRefTree{}, err

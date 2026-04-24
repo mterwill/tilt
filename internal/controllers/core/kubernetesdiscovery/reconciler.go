@@ -495,6 +495,19 @@ func (w *Reconciler) buildStatus(ctx context.Context, watcher watcher) v1alpha1.
 
 	pods = w.maybeLetGoOfDeletedPods(pods, watcher.cluster)
 
+	if len(pods) == 0 && len(watcher.spec.Watches) > 0 && time.Since(watcher.startTime) > 10*time.Minute {
+		var watchedUIDs []string
+		for _, wr := range watcher.spec.Watches {
+			if wr.UID != "" {
+				watchedUIDs = append(watchedUIDs, fmt.Sprintf("%s:%s", wr.Name, wr.UID))
+			}
+		}
+		if len(watchedUIDs) > 0 {
+			logger.Get(ctx).Debugf("kubernetesdiscovery: buildStatus found 0 pods for watcher with %d UID watches %v (knownPods=%d, knownDescendents=%d, watcherAge=%s)",
+				len(watchedUIDs), watchedUIDs, len(w.knownPods), len(w.knownDescendentPodUIDs), time.Since(watcher.startTime).Truncate(time.Second))
+		}
+	}
+
 	startTime := apis.NewMicroTime(watcher.startTime)
 	return v1alpha1.KubernetesDiscoveryStatus{
 		MonitorStartTime: startTime,
@@ -647,6 +660,10 @@ func (w *Reconciler) handlePodChange(ctx context.Context, nsKey nsKey, ownerFetc
 	defer w.mu.Unlock()
 
 	triageResults := w.triagePodTree(nsKey, pod, objTree)
+	if len(triageResults) == 0 && len(objTree.Owners) > 0 {
+		logger.Get(ctx).Debugf("kubernetesdiscovery: pod %s/%s (uid=%s) has owner tree [%s] but matched no watchers",
+			pod.Namespace, pod.Name, pod.UID, objTree)
+	}
 	for i := range triageResults {
 		watcherID := triageResults[i].watcherID
 		w.requeuer.Add(types.NamespacedName(watcherID))
@@ -825,12 +842,23 @@ func (w *Reconciler) createPodLogStream(ctx context.Context, kd *v1alpha1.Kubern
 
 func (w *Reconciler) dispatchPodChangesLoop(ctx context.Context, nsKey nsKey, ownerFetcher k8s.OwnerFetcher,
 	ch <-chan k8s.ObjectUpdate) {
+	heartbeat := time.NewTicker(1 * time.Minute)
+	defer heartbeat.Stop()
+
+	eventCount := 0
+	lastEventTime := time.Now()
+
 	for {
 		select {
 		case obj, ok := <-ch:
 			if !ok {
+				logger.Get(ctx).Warnf("kubernetesdiscovery: pod watch channel closed for namespace %s (cluster %s); affected watchers will not receive further pod updates",
+					nsKey.namespace, nsKey.cluster.name)
 				return
 			}
+
+			eventCount++
+			lastEventTime = time.Now()
 
 			pod, ok := obj.AsPod()
 			if ok {
@@ -844,7 +872,13 @@ func (w *Reconciler) dispatchPodChangesLoop(ctx context.Context, nsKey nsKey, ow
 				go w.handlePodDelete(namespace, name)
 				continue
 			}
+		case <-heartbeat.C:
+			sinceLastEvent := time.Since(lastEventTime).Truncate(time.Second)
+			logger.Get(ctx).Debugf("kubernetesdiscovery: dispatch loop heartbeat for namespace %s (cluster %s): %d events processed, last event %s ago",
+				nsKey.namespace, nsKey.cluster.name, eventCount, sinceLastEvent)
 		case <-ctx.Done():
+			logger.Get(ctx).Warnf("kubernetesdiscovery: dispatch loop context cancelled for namespace %s (cluster %s)",
+				nsKey.namespace, nsKey.cluster.name)
 			return
 		}
 	}
