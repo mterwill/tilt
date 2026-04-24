@@ -54,7 +54,7 @@ require (
 	github.com/tilt-dev/localregistry-go v0.0.0-20201021185044-ffc4c827f097
 	github.com/tilt-dev/probe v0.3.1
 	github.com/tilt-dev/starlark-lsp v0.0.0-20230210155543-84c13fe0ff94
-	github.com/tilt-dev/tilt-apiserver v0.16.0
+	github.com/tilt-dev/tilt-apiserver v0.16.2
 	github.com/tilt-dev/wmclient v0.0.0-20201109174454-1839d0355fbc
 	github.com/tonistiigi/fsutil v0.0.0-20250605211040-586307ad452f
 	github.com/tonistiigi/units v0.0.0-20180711220420-6950e57a87ea
@@ -228,7 +228,7 @@ require (
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/time v0.11.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
-	golang.org/x/tools/go/packages/packagestest v0.1.1-deprecated // indirect
+	golang.org/x/tools/go/expect v0.1.0-deprecated // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/genproto v0.0.0-20241118233622-e639e219e697 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
