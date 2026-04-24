@@ -88,6 +88,12 @@ type Reconciler struct {
 	// For example, a Deployment UID might contain a set of N pod UIDs.
 	knownDescendentPodUIDs map[uidKey]k8s.UIDSet
 
+	// podToAncestors is the reverse index of knownDescendentPodUIDs: it maps a
+	// pod's uidKey to the set of ancestor uidKeys that own it.  This allows
+	// handlePodChange to requeue the right watchers even when OwnerTreeOf fails
+	// on a subsequent update for an already-tracked pod.
+	podToAncestors map[uidKey][]uidKey
+
 	// knownPods is an index of all the known pods and associated Tilt-derived metadata, by UID.
 	knownPods             map[uidKey]*v1.Pod
 	knownPodOwnerCreation map[uidKey]metav1.Time
@@ -127,6 +133,7 @@ func NewReconciler(ctrlClient ctrlclient.Client, scheme *runtime.Scheme, clients
 		uidWatchers:            make(map[uidKey]watcherSet),
 		watchers:               make(map[watcherID]watcher),
 		knownDescendentPodUIDs: make(map[uidKey]k8s.UIDSet),
+		podToAncestors:         make(map[uidKey][]uidKey),
 		knownPods:              make(map[uidKey]*v1.Pod),
 		knownPodOwnerCreation:  make(map[uidKey]metav1.Time),
 		deletedPods:            make(map[uidKey]bool),
@@ -568,7 +575,9 @@ func (w *Reconciler) triagePodTree(nsKey nsKey, pod *v1.Pod, objTree k8s.ObjectR
 		w.knownPodOwnerCreation[podKey] = objTree.Owners[0].CreationTimestamp
 	}
 
-	// Set up the descendent pod UID index
+	// Set up the descendent pod UID index and the reverse (pod -> ancestors) index.
+	podKey := uidKey{cluster: nsKey.cluster, uid: podUID}
+	var ancestors []uidKey
 	for _, ownerUID := range objTree.UIDs() {
 		if podUID == ownerUID {
 			continue
@@ -581,7 +590,9 @@ func (w *Reconciler) triagePodTree(nsKey nsKey, pod *v1.Pod, objTree k8s.ObjectR
 			w.knownDescendentPodUIDs[ownerKey] = set
 		}
 		set.Add(podUID)
+		ancestors = append(ancestors, ownerKey)
 	}
+	w.podToAncestors[podKey] = ancestors
 
 	seenWatchers := make(map[watcherID]bool)
 	var results []triageResult
@@ -627,8 +638,8 @@ func (w *Reconciler) triagePodTree(nsKey nsKey, pod *v1.Pod, objTree k8s.ObjectR
 func (w *Reconciler) handlePodChange(ctx context.Context, nsKey nsKey, ownerFetcher k8s.OwnerFetcher, pod *v1.Pod) {
 	objTree, err := ownerFetcher.OwnerTreeOf(ctx, k8s.NewK8sEntity(pod))
 	if err != nil {
-		// In locked-down clusters, the user may not have access to certain types of resources
-		// so it's normal for there to be errors. Ignore them.
+		logger.Get(ctx).Warnf("kubernetesdiscovery: resolving owner tree for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		w.fallbackRequeueForKnownPod(nsKey, pod)
 		return
 	}
 
@@ -639,6 +650,27 @@ func (w *Reconciler) handlePodChange(ctx context.Context, nsKey nsKey, ownerFetc
 	for i := range triageResults {
 		watcherID := triageResults[i].watcherID
 		w.requeuer.Add(types.NamespacedName(watcherID))
+	}
+}
+
+// fallbackRequeueForKnownPod requeues watchers for a pod that was previously
+// triaged but whose current OwnerTreeOf call failed. The pod's data in
+// knownPods is already up-to-date (upsertPod ran before handlePodChange), so
+// requeuing the KubernetesDiscovery will cause it to pick up the latest status.
+func (w *Reconciler) fallbackRequeueForKnownPod(nsKey nsKey, pod *v1.Pod) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	podKey := uidKey{cluster: nsKey.cluster, uid: pod.UID}
+	ancestors := w.podToAncestors[podKey]
+	if len(ancestors) == 0 {
+		return
+	}
+
+	for _, ancestorKey := range ancestors {
+		for wID := range w.uidWatchers[ancestorKey] {
+			w.requeuer.Add(types.NamespacedName(wID))
+		}
 	}
 }
 
