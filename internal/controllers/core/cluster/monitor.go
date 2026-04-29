@@ -2,7 +2,7 @@ package cluster
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/jonboulle/clockwork"
@@ -113,19 +113,23 @@ func (c *clusterHealthMonitor) run(ctx context.Context, clusterNN types.Namespac
 }
 
 func doKubernetesHealthCheck(ctx context.Context, client k8s.Client) error {
-	// TODO(milas): use verbose=true and propagate the info to the Tilt API
-	// 	cluster obj to show in the web UI
-	health, err := client.ClusterHealth(ctx, false)
+	health, err := client.ClusterHealth(ctx, true)
 	if err != nil {
 		return err
 	}
 
 	if !health.Live {
-		return errors.New("cluster did not pass liveness check")
+		if health.LiveOutput != "" {
+			return fmt.Errorf("cluster did not pass liveness check: %s", health.LiveOutput)
+		}
+		return fmt.Errorf("cluster did not pass liveness check")
 	}
 
 	if !health.Ready {
-		return errors.New("cluster not ready")
+		if health.ReadyOutput != "" {
+			return fmt.Errorf("cluster not ready: %s", health.ReadyOutput)
+		}
+		return fmt.Errorf("cluster not ready")
 	}
 
 	return nil
